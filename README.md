@@ -10,7 +10,7 @@
 > ```
 >
 > An edit made here will be silently overwritten on the next mirror. Make it in
-> `edge_search` instead. Last mirrored 2026-09-24.
+> `edge_search` instead. Last mirrored 2026-09-25.
 
 College football is the one sport in this family where DraftKings posts **one-sided milestone ladders** instead of two-sided Over/Under lines, so the projection is an integral over the book's own survival curve rather than a mean read off a single line. Read `NCAAF_STATUS.md` first.
 
