@@ -67,6 +67,7 @@ def _reload_edge(fingerprint: float) -> float:
 
 _reload_edge(source_fingerprint())
 
+from edge import dfs_leverage_ui as LU         # noqa: E402
 from edge import dfs_run_ncaaf as cfb          # noqa: E402
 from edge.ncaaf import base_position           # noqa: E402
 from edge.odds.cli import scraped_client       # noqa: E402
@@ -102,15 +103,44 @@ table.lu td.num {text-align:right; font-variant-numeric:tabular-nums; white-spac
 
 # ── data ────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=300, show_spinner=False)
-def _slates(_nonce: int):
+def _cfb_slates(_nonce: int):
     from edge import dfs
     return cfb.classic_groups(dfs.draft_groups(cfb.DK_SPORT))
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _build(gid, iters: int, stack_n: int, _nonce: int):
+def _cfb_build(gid, iters: int, stack_n: int, _nonce: int):
     client = scraped_client(cfb.SPORT, "dfs")
     return cfb.build_slate(client, draft_group=gid, iters=iters, stack_n=stack_n)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cfb_stack(gid, iters: int, stack_n: int, _nonce: int, qb: str):
+    """The best GPP lineup stacked around one chosen quarterback."""
+    from edge import dfs_opt_ncaaf
+    pool = _cfb_build(gid, iters, stack_n, _nonce)["pool"]
+    return dfs_opt_ncaaf.optimize(pool, mode="gpp", stack_qb=qb, stack_n=stack_n,
+                                  iters=iters, seed=0)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _cfb_leverage(gid, iters: int, stack_n: int, _nonce: int, qbs: tuple):
+    """GPP lineups from chalk to contrarian (edge/dfs_leverage.py) plus the
+    named quarterbacks' stacks, with a simulated field."""
+    from edge import dfs_leverage_sports as LS
+    extra = [_cfb_stack(gid, iters, stack_n, _nonce, qb) for qb in qbs]
+    return LS.ncaaf(_cfb_build(gid, iters, stack_n, _nonce), None, iters=max(60, iters // 3),
+                    stack_n=stack_n, extra=extra)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _cfb_leverage_for(gid, iters: int, stack_n: int, _nonce: int, qbs: tuple, contest: dict):
+    """The same lineups ranked by expected payout in one contest -- the same
+    simulated worlds edge/dfs_leverage_sports.ncaaf drew (3,000, seed 1)."""
+    from edge import dfs_field, dfs_leverage as lev, dfs_ncaaf_theory, dfs_opt_ncaaf
+    pool = _cfb_build(gid, iters, stack_n, _nonce)["pool"]
+    sims = dfs_field.simulate(pool, dfs_opt_ncaaf._sd, dfs_ncaaf_theory.rho, n_sims=3000, seed=1)
+    return lev.with_contest(_cfb_leverage(gid, iters, stack_n, _nonce, qbs), sims, contest)
 
 
 def _source_badge():
@@ -130,6 +160,9 @@ def _source_badge():
             st.sidebar.caption(
                 "Getting stale. On the desktop: `python3 scripts/odds_collect.py "
                 "--profile dfs_ncaaf --push`.")
+        if client.problem:
+            st.sidebar.caption(f"⚠️ Could not read GitHub ({client.problem}), "
+                               "so these are the prices deployed with the app.")
     else:
         st.sidebar.warning("🟡 Falling back to the paid Odds API — and it cannot "
                            "serve ladders, so the board will be empty.")
@@ -165,7 +198,7 @@ with st.sidebar:
         st.rerun()
 
     try:
-        slates = _slates(st.session_state.cfb_nonce)
+        slates = _cfb_slates(st.session_state.cfb_nonce)
     except Exception as exc:                                # noqa: BLE001
         slates = []
         st.error(f"DraftKings lobby unreachable: {exc}")
@@ -173,8 +206,12 @@ with st.sidebar:
     gid = None
     if slates:
         labels = [f"{s['label']} · {s['games']}g · {_et(s['start'])}" for s in slates]
+        # A slate with games first: once the Main slate locks, DK's "Main" is
+        # next week's, listed with 0 games and no salaries (2026-09-26 NCAAF
+        # opened on it with tonight's Late Night slate still to play).
         default = max(range(len(slates)),
-                      key=lambda i: (slates[i]["label"] == "Main",
+                      key=lambda i: (slates[i]["games"] > 0,
+                                     slates[i]["label"] == "Main",
                                      slates[i]["games"]))
         choice = st.selectbox("Slate", labels, index=default,
                               help="DK Classic slates only. 'Main' is the one "
@@ -203,7 +240,7 @@ if not slates:
 
 with st.spinner("Building cash + GPP lineups…"):
     try:
-        res = _build(gid, iters, stack_n, st.session_state.cfb_nonce)
+        res = _cfb_build(gid, iters, stack_n, st.session_state.cfb_nonce)
     except Exception as exc:                                # noqa: BLE001
         st.error(f"Build failed: {exc}")
         st.exception(exc)
@@ -215,6 +252,8 @@ if res.get("error"):
 if res.get("unpriced"):
     st.warning("DraftKings lists this slate but has not PRICED it yet — that is "
                "normal a few days out. Try again closer to kickoff.")
+    if res.get("unpriced_reason"):
+        st.caption(res["unpriced_reason"])
     st.stop()
 
 meta, stats = res["meta"], res["stats"]
@@ -324,8 +363,8 @@ def _csv() -> bytes:
     w = csv.writer(buf)
     w.writerow(["mode", "slot", "player", "team", "opp", "salary", "proj",
                 "own", "leverage", "band"])
-    for mode in ("cash", "gpp"):
-        for r in cfb.lineup_rows(res.get(mode)):
+    for mode, lu in (("cash", res.get("cash")), ("gpp", gpp_pick)):
+        for r in cfb.lineup_rows(lu):
             w.writerow([mode, r["slot"], r["player"], r["team"], r["opp"],
                         r["salary"], r["proj"], r["own"], r["leverage"],
                         r["band"]])
@@ -335,8 +374,39 @@ def _csv() -> bytes:
 t_cash, t_gpp, t_board = st.tabs(["💵 CASH", "🚀 GPP", "📋 Board"])
 with t_cash:
     render(res.get("cash"), "cash")
+gpp_pick = res.get("gpp")
 with t_gpp:
-    render(res.get("gpp"), "gpp")
+    # Chalk or contrarian is the contest's call (edge/dfs_leverage.py): the
+    # optimiser's lineup out to deep contrarian, plus the top quarterbacks'
+    # stacks, ranked by expected payout in the contest picked.
+    _qbs = sorted((p for p in res["pool"] if base_position(p.get("dk_pos")) == "QB"),
+                  key=lambda p: -(p.get("proj") or 0))
+    _cands = [q["name"] for q in _qbs[:8]]
+    _nonce = st.session_state.cfb_nonce
+    _contest = LU.contest_picker("NCAAF", res["gid"], key="cfb")
+    _lev_on = _contest is not None or st.toggle(
+        "Chalk ↔ contrarian map", key="cfb_lev_on",
+        help="Every GPP lineup from the chalkiest to the most contrarian (the top 8 QBs' "
+             "stacks included), on a chart of ownership against points, beside a "
+             "simulated field.")
+    if _lev_on:
+        with st.spinner("Building lineups from chalk to contrarian (~1 min the first time)…"):
+            _an = (_cfb_leverage_for(gid, iters, stack_n, _nonce, tuple(_cands), _contest) if _contest
+                   else _cfb_leverage(gid, iters, stack_n, _nonce, tuple(_cands)))
+        _chosen = LU.leverage_view(_an, key="cfb")
+        if _chosen:
+            gpp_pick = _chosen["result"]
+            render(gpp_pick, "gpp")
+    else:
+        _opts = ["Auto (best)"] + [f"{q['name']} ({q['team']}) · {q['proj']} pts · "
+                                   f"{q.get('own', 0):.0f}% own" for q in _qbs]
+        _pick = st.selectbox("Stack", _opts, index=0,
+                             help="Build the GPP lineup around a quarterback you choose.")
+        if _pick != "Auto (best)":
+            _qb = _qbs[_opts.index(_pick) - 1]["name"]
+            with st.spinner(f"Building a {_qb} stack…"):
+                gpp_pick = _cfb_stack(gid, iters, stack_n, _nonce, _qb)
+        render(gpp_pick, "gpp")
 with t_board:
     pool = sorted(res["pool"], key=lambda p: -(p.get("proj") or 0))
     pos_filter = st.multiselect("Position", ["QB", "RB", "WR"], default=[])
